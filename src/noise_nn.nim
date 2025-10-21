@@ -1,6 +1,8 @@
 import std/[sysrand, strutils]
 import monocypher
-import nimcrypto/sha2
+import nimcrypto/[hmac, sha2]
+import bearssl/blockx
+import stew/[ptrops, byteutils]
 
 const
   DHLEN = 32
@@ -13,6 +15,10 @@ type
   KeyPair = object
     private: array[DHLEN, byte]
     `public`: array[DHLEN, byte]
+
+proc strToBytes(s: string): seq[byte] =
+  result = @[]
+  for c in s: result.add(byte(c))
 
 proc generateKeypair(): KeyPair =
   let randBytes = urandom(DHLEN)
@@ -28,13 +34,48 @@ proc hash(data: openArray[byte]): array[HASHLEN, byte] =
   ctx.update(data)
   result = ctx.finish().data
 
-proc hkdf(ck: openArray[byte], ikm: openArray[byte], numOutputs: int): seq[seq[byte]] =
-  var okm = newSeq[byte](HASHLEN * numOutputs)
-  hkdf[sha256](ikm, ck, @[], okm)
-  result = @[]
+proc hkdfExtract(salt, ikm: openArray[byte]): array[HASHLEN, byte] =
+  var ctx: HMAC[sha2.sha256]
+  ctx.init(salt)
+  ctx.update(ikm)
+  result = ctx.finish().data
+
+proc hkdfExpand(prk, info: openArray[byte], length: int): seq[byte] =
+  let hashLen = HASHLEN
+  let n = (length + hashLen - 1) div HASHLEN
+  result = newSeq[byte](length)
+  var t: seq[byte] = @[]
+  var pos = 0
+  for i in 1..n:
+    var ctx: HMAC[sha2.sha256]
+    ctx.init(prk)
+    if t.len > 0:
+      ctx.update(t)
+    ctx.update(info)
+    var counter = [byte(i)]
+    ctx.update(counter)
+    var output: array[HASHLEN, byte]
+    discard ctx.finish(output)
+    let toCopy = min(hashLen, length - pos)
+    copyMem(addr result[pos], addr output[0], toCopy)
+    pos += toCopy
+    t = newSeq[byte](output.len)
+    copyMem(addr t[0], addr output[0], output.len)
+
+proc hkdf(salt, ikm: openArray[byte], numOutputs: int): seq[array[HASHLEN, byte]] =
+  let prk = hkdfExtract(salt, ikm)
+  let expanded = hkdfExpand(prk, @[], numOutputs * HASHLEN)
+  result = newSeq[array[HASHLEN, byte]](numOutputs)
   for i in 0..<numOutputs:
-    let start = i * HASHLEN
-    result.add(okm[start..<start + HASHLEN])
+    copyMem(addr result[i][0], addr expanded[i * HASHLEN], HASHLEN)
+
+# proc hkdf(ck: openArray[byte], ikm: openArray[byte], numOutputs: int): seq[seq[byte]] =
+#   var okm = newSeq[byte](HASHLEN * numOutputs)
+#   hkdf[sha256](ikm, ck, @[], okm)
+#   result = @[]
+#   for i in 0..<numOutputs:
+#     let start = i * HASHLEN
+#     result.add(okm[start..<start + HASHLEN])
 
 proc putLe64(buf: var openArray[byte], offset: int, value: uint64) =
   var v = value
@@ -43,72 +84,114 @@ proc putLe64(buf: var openArray[byte], offset: int, value: uint64) =
     v = v shr 8
 
 proc aeadEncrypt(key: array[KEYLEN, byte], nonce: array[12, byte], ad, plaintext: openArray[byte]): seq[byte] =
-  # Compute poly key
-  var zeros: array[64, byte]
-  crypto_chacha20_ietf(addr zeros, addr zeros, 64, key, nonce, 0)
-  var polyKey: array[32, byte]
-  copyMem(addr polyKey, addr zeros, 32)
-
-  # Encrypt
-  result = newSeq[byte](plaintext.len)
+  result = newSeq[byte](plaintext.len + 16)
   if plaintext.len > 0:
-    crypto_chacha20_ietf(addr result[0], unsafeAddr plaintext[0], plaintext.len, key, nonce, 1)
+    copyMem(addr result[0], unsafeAddr plaintext[0], plaintext.len)
 
-  # Compute mac
-  let adPadLen = ((ad.len + 15) div 16) * 16
-  let ctPadLen = ((result.len + 15) div 16) * 16
-  let totalLen = adPadLen + ctPadLen + 16
-  var input = newSeq[byte](totalLen)
-  if ad.len > 0:
-    copyMem(addr input[0], unsafeAddr ad[0], ad.len)
-  # pads are zero by default
-  let ctOffset = adPadLen
-  if result.len > 0:
-    copyMem(addr input[ctOffset], addr result[0], result.len)
-  putLe64(input, totalLen - 16, uint64(ad.len))
-  putLe64(input, totalLen - 8, uint64(result.len))
-
-  var mac: array[16, byte]
-  crypto_poly1305(mac, input, polyKey)
-
-  result.add(mac)
+  var tag: array[16, byte]
+  let adPtr = if ad.len > 0: unsafeAddr ad[0] else: nil
+  poly1305CtmulRun(
+    unsafeAddr key[0],
+    unsafeAddr nonce[0],
+    baseAddr(result),
+    uint(plaintext.len),
+    adPtr,
+    uint(ad.len),
+    baseAddr(tag),
+    cast[Chacha20Run](chacha20CtRun),
+    1.cint
+  )
+  copyMem(addr result[plaintext.len], addr tag[0], 16)
 
 proc aeadDecrypt(key: array[KEYLEN, byte], nonce: array[12, byte], ad, ciphertext: openArray[byte]): seq[byte] =
   if ciphertext.len < 16:
     raise newException(ValueError, "invalid ciphertext")
   let ctLen = ciphertext.len - 16
-  let ct = ciphertext[0..<ctLen]
-  let mac = ciphertext[ctLen..<ciphertext.len]
-
-  # Compute poly key
-  var zeros: array[64, byte]
-  crypto_chacha20_ietf(addr zeros, addr zeros, 64, key, nonce, 0)
-  var polyKey: array[32, byte]
-  copyMem(addr polyKey, addr zeros, 32)
-
-  # Compute expected mac
-  let adPadLen = ((ad.len + 15) div 16) * 16
-  let ctPadLen = ((ctLen + 15) div 16) * 16
-  let totalLen = adPadLen + ctPadLen + 16
-  var input = newSeq[byte](totalLen)
-  if ad.len > 0:
-    copyMem(addr input[0], unsafeAddr ad[0], ad.len)
-  let ctOffset = adPadLen
-  if ctLen > 0:
-    copyMem(addr input[ctOffset], unsafeAddr ct[0], ctLen)
-  putLe64(input, totalLen - 16, uint64(ad.len))
-  putLe64(input, totalLen - 8, uint64(ctLen))
-
-  var computedMac: array[16, byte]
-  crypto_poly1305(computedMac, input, polyKey)
-
-  if computedMac != array[16, byte](mac):
-    raise newException(ValueError, "decryption failed")
-
-  # Decrypt
   result = newSeq[byte](ctLen)
   if ctLen > 0:
-    crypto_chacha20_ietf(addr result[0], unsafeAddr ct[0], ctLen, key, nonce, 1)
+    copyMem(addr result[0], unsafeAddr ciphertext[0], ctLen)
+  var tag: array[16, byte]
+  copyMem(addr tag[0], unsafeAddr ciphertext[ctLen], 16)
+  let adPtr = if ad.len > 0: unsafeAddr ad[0] else: nil
+  poly1305CtmulRun(
+    unsafeAddr key[0],
+    unsafeAddr nonce[0],
+    baseAddr(result),
+    uint(ctLen),
+    adPtr,
+    uint(ad.len),
+    baseAddr(tag),
+    cast[Chacha20Run](chacha20CtRun),
+    0.cint
+  )
+
+# proc aeadEncrypt(key: array[KEYLEN, byte], nonce: array[12, byte], ad, plaintext: openArray[byte]): seq[byte] =
+#   # Compute poly key
+#   var zeros: array[64, byte]
+#   crypto_chacha20_ietf(addr zeros, addr zeros, 64, key, nonce, 0)
+#   var polyKey: array[32, byte]
+#   copyMem(addr polyKey, addr zeros, 32)
+
+#   # Encrypt
+#   result = newSeq[byte](plaintext.len)
+#   if plaintext.len > 0:
+#     crypto_chacha20_ietf(addr result[0], unsafeAddr plaintext[0], plaintext.len, key, nonce, 1)
+
+#   # Compute mac
+#   let adPadLen = ((ad.len + 15) div 16) * 16
+#   let ctPadLen = ((result.len + 15) div 16) * 16
+#   let totalLen = adPadLen + ctPadLen + 16
+#   var input = newSeq[byte](totalLen)
+#   if ad.len > 0:
+#     copyMem(addr input[0], unsafeAddr ad[0], ad.len)
+#   # pads are zero by default
+#   let ctOffset = adPadLen
+#   if result.len > 0:
+#     copyMem(addr input[ctOffset], addr result[0], result.len)
+#   putLe64(input, totalLen - 16, uint64(ad.len))
+#   putLe64(input, totalLen - 8, uint64(result.len))
+
+#   var mac: array[16, byte]
+#   crypto_poly1305(mac, input, polyKey)
+
+#   result.add(mac)
+
+# proc aeadDecrypt(key: array[KEYLEN, byte], nonce: array[12, byte], ad, ciphertext: openArray[byte]): seq[byte] =
+#   if ciphertext.len < 16:
+#     raise newException(ValueError, "invalid ciphertext")
+#   let ctLen = ciphertext.len - 16
+#   let ct = ciphertext[0..<ctLen]
+#   let mac = ciphertext[ctLen..<ciphertext.len]
+
+#   # Compute poly key
+#   var zeros: array[64, byte]
+#   crypto_chacha20_ietf(addr zeros, addr zeros, 64, key, nonce, 0)
+#   var polyKey: array[32, byte]
+#   copyMem(addr polyKey, addr zeros, 32)
+
+#   # Compute expected mac
+#   let adPadLen = ((ad.len + 15) div 16) * 16
+#   let ctPadLen = ((ctLen + 15) div 16) * 16
+#   let totalLen = adPadLen + ctPadLen + 16
+#   var input = newSeq[byte](totalLen)
+#   if ad.len > 0:
+#     copyMem(addr input[0], unsafeAddr ad[0], ad.len)
+#   let ctOffset = adPadLen
+#   if ctLen > 0:
+#     copyMem(addr input[ctOffset], unsafeAddr ct[0], ctLen)
+#   putLe64(input, totalLen - 16, uint64(ad.len))
+#   putLe64(input, totalLen - 8, uint64(ctLen))
+
+#   var computedMac: array[16, byte]
+#   crypto_poly1305(computedMac, input, polyKey)
+
+#   if computedMac != array[16, byte](mac):
+#     raise newException(ValueError, "decryption failed")
+
+#   # Decrypt
+#   result = newSeq[byte](ctLen)
+#   if ctLen > 0:
+#     crypto_chacha20_ietf(addr result[0], unsafeAddr ct[0], ctLen, key, nonce, 1)
 
 type
   CipherState = ref object
@@ -123,7 +206,8 @@ proc initializeKey(cs: CipherState, key: array[KEYLEN, byte]) =
   cs.n = 0
 
 proc hasKey(cs: CipherState): bool =
-  cs.k != array[KEYLEN, byte]()
+  var zeros: array[KEYLEN, byte]
+  cs.k != zeros
 
 proc encrypt(cs: CipherState, ad, plaintext: openArray[byte]): seq[byte] =
   if not cs.hasKey():
@@ -151,18 +235,22 @@ type
     ck: array[HASHLEN, byte]
     h: array[HASHLEN, byte]
 
-proc newSymmetricState(): SymmetricState =
-  result = SymmetricState(cs: newCipherState())
-  result.initializeSymmetric(PROTOCOL_NAME)
-
 proc initializeSymmetric(ss: SymmetricState, protocolName: string) =
-  let pn = protocolName.toOpenArrayByte(0, protocolName.high)
+  var pn: seq[byte] = @[]
+  for c in protocolName:
+    pn.add(byte(c))
+
   if pn.len == HASHLEN:
     ss.h = cast[array[HASHLEN, byte]](pn)
   else:
     ss.h = hash(pn)
   ss.ck = ss.h
-  ss.cs.initializeKey(array[KEYLEN, byte]())
+  var zeros: array[KEYLEN, byte]
+  ss.cs.initializeKey(zeros)
+
+proc newSymmetricState(): SymmetricState =
+  result = SymmetricState(cs: newCipherState())
+  result.initializeSymmetric(PROTOCOL_NAME)
 
 proc mixKey(ss: SymmetricState, inputKeyMaterial: openArray[byte]) =
   let outputs = hkdf(ss.ck, inputKeyMaterial, 2)
@@ -283,7 +371,7 @@ proc main() =
   let (payload1, _, _) = responderHS.readMessage(msg1)
   echo "Responder received payload 1: ", cast[string](payload1)
 
-  let helloResponder = "Hello from responder!".toOpenArrayByte(0, 20)
+  let helloResponder = strToBytes("Hello from responder!")
   let (msg2, _, recvCSResp) = responderHS.writeMessage(helloResponder)
   echo "Responder sent message 2: ", msg2.toHex.toLowerAscii
 
@@ -292,7 +380,7 @@ proc main() =
   echo "Initiator received payload 2: ", cast[string](payload2)
 
   # Post-handshake: Initiator sends encrypted message to responder
-  let message = "Hello from initiator!".toOpenArrayByte(0, 20)
+  let message = strToBytes("Hello from initiator!")
   let ciphertext = sendCSInit.encrypt(@[], message)
   echo "Initiator encrypted: ", ciphertext.toHex.toLowerAscii
 
