@@ -10,3 +10,6 @@ srcDir        = "src"
 # Dependencies
 
 requires "nim >= 2.2.4"
+
+task noise, "Run Noise example":
+  exec "nim c -r src/noise_nn.nim"
