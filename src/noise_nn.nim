@@ -15,19 +15,18 @@ type
     `public`: array[DHLEN, byte]
 
 proc generateKeypair(): KeyPair =
-  result.private = urandom(DHLEN)
-  crypto_x25519_public_key(result.`public`, result.private)
+  let randBytes = urandom(DHLEN)
+  copyMem(addr result.private[0], unsafeAddr randBytes[0], DHLEN)
+  result.`public` = crypto_key_exchange_public_key(result.private)
 
 proc dh(priv: array[DHLEN, byte], pub: array[DHLEN, byte]): array[DHLEN, byte] =
-  var shared: array[DHLEN, byte]
-  crypto_x25519(shared, priv, pub)
-  shared
+  result = crypto_key_exchange(priv, pub)
 
 proc hash(data: openArray[byte]): array[HASHLEN, byte] =
   var ctx: sha256
   ctx.init()
   ctx.update(data)
-  ctx.finish(result)
+  result = ctx.finish().data
 
 proc hkdf(ck: openArray[byte], ikm: openArray[byte], numOutputs: int): seq[seq[byte]] =
   var okm = newSeq[byte](HASHLEN * numOutputs)
