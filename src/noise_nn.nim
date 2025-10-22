@@ -2,7 +2,9 @@ import std/[sysrand, strutils]
 import monocypher
 import nimcrypto/[hmac, sha2]
 import bearssl/blockx
+import bearssl/[kdf, hash]
 import stew/[ptrops, byteutils]
+import bearssl/abi/inner
 
 const
   DHLEN = 32
@@ -15,6 +17,49 @@ type
   KeyPair = object
     private: array[DHLEN, byte]
     `public`: array[DHLEN, byte]
+
+type HkdfResult*[len: static int] = array[len, byte]
+
+proc hkdf*[T: sha256, len: static int](
+    _: type[T],
+    salt, ikm, info: openArray[byte],
+    outputs: var openArray[HkdfResult[len]],
+) =
+  var ctx: HkdfContext
+  hkdfInit(
+    ctx,
+    addr sha256Vtable,
+    if salt.len > 0:
+      unsafeAddr salt[0]
+    else:
+      nil,
+    csize_t(salt.len),
+  )
+  hkdfInject(
+    ctx,
+    if ikm.len > 0:
+      unsafeAddr ikm[0]
+    else:
+      nil,
+    csize_t(ikm.len),
+  )
+  hkdfFlip(ctx)
+  for i in 0 .. outputs.high:
+    discard hkdfProduce(
+      ctx,
+      if info.len > 0:
+        unsafeAddr info[0]
+      else:
+        nil,
+      csize_t(info.len),
+      addr outputs[i][0],
+      csize_t(outputs[i].len),
+    )
+
+proc hkdf(salt, ikm: openArray[byte], numOutputs: int): seq[array[HASHLEN, byte]] =
+  var outputs = newSeq[array[HASHLEN, byte]](numOutputs)
+  hkdf[sha256, HASHLEN](sha256, salt, ikm, @[], outputs)
+  result = outputs
 
 proc strToBytes(s: string): seq[byte] =
   result = @[]
@@ -34,40 +79,40 @@ proc hash(data: openArray[byte]): array[HASHLEN, byte] =
   ctx.update(data)
   result = ctx.finish().data
 
-proc hkdfExtract(salt, ikm: openArray[byte]): array[HASHLEN, byte] =
-  var ctx: HMAC[sha2.sha256]
-  ctx.init(salt)
-  ctx.update(ikm)
-  result = ctx.finish().data
+# proc hkdfExtract(salt, ikm: openArray[byte]): array[HASHLEN, byte] =
+#   var ctx: HMAC[sha2.sha256]
+#   ctx.init(salt)
+#   ctx.update(ikm)
+#   result = ctx.finish().data
 
-proc hkdfExpand(prk, info: openArray[byte], length: int): seq[byte] =
-  let hashLen = HASHLEN
-  let n = (length + hashLen - 1) div HASHLEN
-  result = newSeq[byte](length)
-  var t: seq[byte] = @[]
-  var pos = 0
-  for i in 1..n:
-    var ctx: HMAC[sha2.sha256]
-    ctx.init(prk)
-    if t.len > 0:
-      ctx.update(t)
-    ctx.update(info)
-    var counter = [byte(i)]
-    ctx.update(counter)
-    var output: array[HASHLEN, byte]
-    discard ctx.finish(output)
-    let toCopy = min(hashLen, length - pos)
-    copyMem(addr result[pos], addr output[0], toCopy)
-    pos += toCopy
-    t = newSeq[byte](output.len)
-    copyMem(addr t[0], addr output[0], output.len)
+# proc hkdfExpand(prk, info: openArray[byte], length: int): seq[byte] =
+#   let hashLen = HASHLEN
+#   let n = (length + hashLen - 1) div HASHLEN
+#   result = newSeq[byte](length)
+#   var t: seq[byte] = @[]
+#   var pos = 0
+#   for i in 1..n:
+#     var ctx: HMAC[sha2.sha256]
+#     ctx.init(prk)
+#     if t.len > 0:
+#       ctx.update(t)
+#     ctx.update(info)
+#     var counter = [byte(i)]
+#     ctx.update(counter)
+#     var output: array[HASHLEN, byte]
+#     discard ctx.finish(output)
+#     let toCopy = min(hashLen, length - pos)
+#     copyMem(addr result[pos], addr output[0], toCopy)
+#     pos += toCopy
+#     t = newSeq[byte](output.len)
+#     copyMem(addr t[0], addr output[0], output.len)
 
-proc hkdf(salt, ikm: openArray[byte], numOutputs: int): seq[array[HASHLEN, byte]] =
-  let prk = hkdfExtract(salt, ikm)
-  let expanded = hkdfExpand(prk, @[], numOutputs * HASHLEN)
-  result = newSeq[array[HASHLEN, byte]](numOutputs)
-  for i in 0..<numOutputs:
-    copyMem(addr result[i][0], addr expanded[i * HASHLEN], HASHLEN)
+# proc hkdf(salt, ikm: openArray[byte], numOutputs: int): seq[array[HASHLEN, byte]] =
+#   let prk = hkdfExtract(salt, ikm)
+#   let expanded = hkdfExpand(prk, @[], numOutputs * HASHLEN)
+#   result = newSeq[array[HASHLEN, byte]](numOutputs)
+#   for i in 0..<numOutputs:
+#     copyMem(addr result[i][0], addr expanded[i * HASHLEN], HASHLEN)
 
 # proc hkdf(ck: openArray[byte], ikm: openArray[byte], numOutputs: int): seq[seq[byte]] =
 #   var okm = newSeq[byte](HASHLEN * numOutputs)
@@ -235,13 +280,27 @@ type
     ck: array[HASHLEN, byte]
     h: array[HASHLEN, byte]
 
+# proc initializeSymmetric(ss: SymmetricState, protocolName: string) =
+#   var pn: seq[byte] = @[]
+#   for c in protocolName:
+#     pn.add(byte(c))
+
+#   if pn.len == HASHLEN:
+#     ss.h = cast[array[HASHLEN, byte]](pn)
+#   else:
+#     ss.h = hash(pn)
+#   ss.ck = ss.h
+#   var zeros: array[KEYLEN, byte]
+#   ss.cs.initializeKey(zeros)
+
 proc initializeSymmetric(ss: SymmetricState, protocolName: string) =
-  var pn: seq[byte] = @[]
+  var pn: seq[byte]
   for c in protocolName:
     pn.add(byte(c))
 
   if pn.len == HASHLEN:
-    ss.h = cast[array[HASHLEN, byte]](pn)
+    for i in 0..<HASHLEN:
+      ss.h[i] = pn[i]
   else:
     ss.h = hash(pn)
   ss.ck = ss.h
@@ -252,16 +311,25 @@ proc newSymmetricState(): SymmetricState =
   result = SymmetricState(cs: newCipherState())
   result.initializeSymmetric(PROTOCOL_NAME)
 
+# proc mixKey(ss: SymmetricState, inputKeyMaterial: openArray[byte]) =
+#   let outputs = hkdf(ss.ck, inputKeyMaterial, 2)
+#   ss.ck = cast[array[HASHLEN, byte]](outputs[0])
+#   let key = cast[array[KEYLEN, byte]](outputs[1])
+#   ss.cs.initializeKey(key)
+
 proc mixKey(ss: SymmetricState, inputKeyMaterial: openArray[byte]) =
   let outputs = hkdf(ss.ck, inputKeyMaterial, 2)
-  ss.ck = cast[array[HASHLEN, byte]](outputs[0])
-  let key = cast[array[KEYLEN, byte]](outputs[1])
+  for i in 0..<HASHLEN:
+    ss.ck[i] = outputs[0][i]
+  var key: array[KEYLEN, byte]
+  copyMem(addr key[0], addr outputs[1][0], KEYLEN)
   ss.cs.initializeKey(key)
 
 proc mixHash(ss: SymmetricState, data: openArray[byte]) =
   var input = newSeq[byte](ss.h.len + data.len)
   copyMem(addr input[0], unsafeAddr ss.h[0], ss.h.len)
-  copyMem(addr input[ss.h.len], unsafeAddr data[0], data.len)
+  if data.len > 0:
+    copyMem(addr input[ss.h.len], unsafeAddr data[0], data.len)
   ss.h = hash(input)
 
 proc encryptAndHash(ss: SymmetricState, plaintext: openArray[byte]): seq[byte] =
@@ -272,10 +340,21 @@ proc decryptAndHash(ss: SymmetricState, ciphertext: openArray[byte]): seq[byte] 
   result = ss.cs.decrypt(ss.h, ciphertext)
   ss.mixHash(ciphertext)
 
+# proc split(ss: SymmetricState): (CipherState, CipherState) =
+#   let outputs = hkdf(ss.ck, @[], 2)
+#   let k1 = cast[array[KEYLEN, byte]](outputs[0])
+#   let k2 = cast[array[KEYLEN, byte]](outputs[1])
+#   let c1 = newCipherState()
+#   c1.initializeKey(k1)
+#   let c2 = newCipherState()
+#   c2.initializeKey(k2)
+#   (c1, c2)
+
 proc split(ss: SymmetricState): (CipherState, CipherState) =
   let outputs = hkdf(ss.ck, @[], 2)
-  let k1 = cast[array[KEYLEN, byte]](outputs[0])
-  let k2 = cast[array[KEYLEN, byte]](outputs[1])
+  var k1, k2: array[KEYLEN, byte]
+  copyMem(addr k1[0], addr outputs[0][0], KEYLEN)
+  copyMem(addr k2[0], addr outputs[1][0], KEYLEN)
   let c1 = newCipherState()
   c1.initializeKey(k1)
   let c2 = newCipherState()
@@ -387,5 +466,8 @@ proc main() =
   # Responder decrypts
   let plaintext = recvCSResp.decrypt(@[], ciphertext)
   echo "Responder decrypted: ", cast[string](plaintext)
+
+  echo "end of demo"
+  echo "end of demo"
 
 main()
