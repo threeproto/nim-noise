@@ -79,49 +79,6 @@ proc hash(data: openArray[byte]): array[HASHLEN, byte] =
   ctx.update(data)
   result = ctx.finish().data
 
-# proc hkdfExtract(salt, ikm: openArray[byte]): array[HASHLEN, byte] =
-#   var ctx: HMAC[sha2.sha256]
-#   ctx.init(salt)
-#   ctx.update(ikm)
-#   result = ctx.finish().data
-
-# proc hkdfExpand(prk, info: openArray[byte], length: int): seq[byte] =
-#   let hashLen = HASHLEN
-#   let n = (length + hashLen - 1) div HASHLEN
-#   result = newSeq[byte](length)
-#   var t: seq[byte] = @[]
-#   var pos = 0
-#   for i in 1..n:
-#     var ctx: HMAC[sha2.sha256]
-#     ctx.init(prk)
-#     if t.len > 0:
-#       ctx.update(t)
-#     ctx.update(info)
-#     var counter = [byte(i)]
-#     ctx.update(counter)
-#     var output: array[HASHLEN, byte]
-#     discard ctx.finish(output)
-#     let toCopy = min(hashLen, length - pos)
-#     copyMem(addr result[pos], addr output[0], toCopy)
-#     pos += toCopy
-#     t = newSeq[byte](output.len)
-#     copyMem(addr t[0], addr output[0], output.len)
-
-# proc hkdf(salt, ikm: openArray[byte], numOutputs: int): seq[array[HASHLEN, byte]] =
-#   let prk = hkdfExtract(salt, ikm)
-#   let expanded = hkdfExpand(prk, @[], numOutputs * HASHLEN)
-#   result = newSeq[array[HASHLEN, byte]](numOutputs)
-#   for i in 0..<numOutputs:
-#     copyMem(addr result[i][0], addr expanded[i * HASHLEN], HASHLEN)
-
-# proc hkdf(ck: openArray[byte], ikm: openArray[byte], numOutputs: int): seq[seq[byte]] =
-#   var okm = newSeq[byte](HASHLEN * numOutputs)
-#   hkdf[sha256](ikm, ck, @[], okm)
-#   result = @[]
-#   for i in 0..<numOutputs:
-#     let start = i * HASHLEN
-#     result.add(okm[start..<start + HASHLEN])
-
 proc putLe64(buf: var openArray[byte], offset: int, value: uint64) =
   var v = value
   for i in 0..<8:
@@ -170,74 +127,6 @@ proc aeadDecrypt(key: array[KEYLEN, byte], nonce: array[12, byte], ad, ciphertex
     0.cint
   )
 
-# proc aeadEncrypt(key: array[KEYLEN, byte], nonce: array[12, byte], ad, plaintext: openArray[byte]): seq[byte] =
-#   # Compute poly key
-#   var zeros: array[64, byte]
-#   crypto_chacha20_ietf(addr zeros, addr zeros, 64, key, nonce, 0)
-#   var polyKey: array[32, byte]
-#   copyMem(addr polyKey, addr zeros, 32)
-
-#   # Encrypt
-#   result = newSeq[byte](plaintext.len)
-#   if plaintext.len > 0:
-#     crypto_chacha20_ietf(addr result[0], unsafeAddr plaintext[0], plaintext.len, key, nonce, 1)
-
-#   # Compute mac
-#   let adPadLen = ((ad.len + 15) div 16) * 16
-#   let ctPadLen = ((result.len + 15) div 16) * 16
-#   let totalLen = adPadLen + ctPadLen + 16
-#   var input = newSeq[byte](totalLen)
-#   if ad.len > 0:
-#     copyMem(addr input[0], unsafeAddr ad[0], ad.len)
-#   # pads are zero by default
-#   let ctOffset = adPadLen
-#   if result.len > 0:
-#     copyMem(addr input[ctOffset], addr result[0], result.len)
-#   putLe64(input, totalLen - 16, uint64(ad.len))
-#   putLe64(input, totalLen - 8, uint64(result.len))
-
-#   var mac: array[16, byte]
-#   crypto_poly1305(mac, input, polyKey)
-
-#   result.add(mac)
-
-# proc aeadDecrypt(key: array[KEYLEN, byte], nonce: array[12, byte], ad, ciphertext: openArray[byte]): seq[byte] =
-#   if ciphertext.len < 16:
-#     raise newException(ValueError, "invalid ciphertext")
-#   let ctLen = ciphertext.len - 16
-#   let ct = ciphertext[0..<ctLen]
-#   let mac = ciphertext[ctLen..<ciphertext.len]
-
-#   # Compute poly key
-#   var zeros: array[64, byte]
-#   crypto_chacha20_ietf(addr zeros, addr zeros, 64, key, nonce, 0)
-#   var polyKey: array[32, byte]
-#   copyMem(addr polyKey, addr zeros, 32)
-
-#   # Compute expected mac
-#   let adPadLen = ((ad.len + 15) div 16) * 16
-#   let ctPadLen = ((ctLen + 15) div 16) * 16
-#   let totalLen = adPadLen + ctPadLen + 16
-#   var input = newSeq[byte](totalLen)
-#   if ad.len > 0:
-#     copyMem(addr input[0], unsafeAddr ad[0], ad.len)
-#   let ctOffset = adPadLen
-#   if ctLen > 0:
-#     copyMem(addr input[ctOffset], unsafeAddr ct[0], ctLen)
-#   putLe64(input, totalLen - 16, uint64(ad.len))
-#   putLe64(input, totalLen - 8, uint64(ctLen))
-
-#   var computedMac: array[16, byte]
-#   crypto_poly1305(computedMac, input, polyKey)
-
-#   if computedMac != array[16, byte](mac):
-#     raise newException(ValueError, "decryption failed")
-
-#   # Decrypt
-#   result = newSeq[byte](ctLen)
-#   if ctLen > 0:
-#     crypto_chacha20_ietf(addr result[0], unsafeAddr ct[0], ctLen, key, nonce, 1)
-
 type
   CipherState = ref object
     k: array[KEYLEN, byte]
@@ -280,19 +169,6 @@ type
     ck: array[HASHLEN, byte]
     h: array[HASHLEN, byte]
 
-# proc initializeSymmetric(ss: SymmetricState, protocolName: string) =
-#   var pn: seq[byte] = @[]
-#   for c in protocolName:
-#     pn.add(byte(c))
-
-#   if pn.len == HASHLEN:
-#     ss.h = cast[array[HASHLEN, byte]](pn)
-#   else:
-#     ss.h = hash(pn)
-#   ss.ck = ss.h
-#   var zeros: array[KEYLEN, byte]
-#   ss.cs.initializeKey(zeros)
-
 proc initializeSymmetric(ss: SymmetricState, protocolName: string) =
   var pn: seq[byte]
   for c in protocolName:
@@ -310,12 +186,6 @@ proc initializeSymmetric(ss: SymmetricState, protocolName: string) =
 proc newSymmetricState(): SymmetricState =
   result = SymmetricState(cs: newCipherState())
   result.initializeSymmetric(PROTOCOL_NAME)
-
-# proc mixKey(ss: SymmetricState, inputKeyMaterial: openArray[byte]) =
-#   let outputs = hkdf(ss.ck, inputKeyMaterial, 2)
-#   ss.ck = cast[array[HASHLEN, byte]](outputs[0])
-#   let key = cast[array[KEYLEN, byte]](outputs[1])
-#   ss.cs.initializeKey(key)
 
 proc mixKey(ss: SymmetricState, inputKeyMaterial: openArray[byte]) =
   let outputs = hkdf(ss.ck, inputKeyMaterial, 2)
@@ -339,16 +209,6 @@ proc encryptAndHash(ss: SymmetricState, plaintext: openArray[byte]): seq[byte] =
 proc decryptAndHash(ss: SymmetricState, ciphertext: openArray[byte]): seq[byte] =
   result = ss.cs.decrypt(ss.h, ciphertext)
   ss.mixHash(ciphertext)
-
-# proc split(ss: SymmetricState): (CipherState, CipherState) =
-#   let outputs = hkdf(ss.ck, @[], 2)
-#   let k1 = cast[array[KEYLEN, byte]](outputs[0])
-#   let k2 = cast[array[KEYLEN, byte]](outputs[1])
-#   let c1 = newCipherState()
-#   c1.initializeKey(k1)
-#   let c2 = newCipherState()
-#   c2.initializeKey(k2)
-#   (c1, c2)
 
 proc split(ss: SymmetricState): (CipherState, CipherState) =
   let outputs = hkdf(ss.ck, @[], 2)
