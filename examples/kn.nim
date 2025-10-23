@@ -1,4 +1,4 @@
-# Demonstration of the Noise NN handshake.
+# Demonstration of the Noise KN handshake.
 
 import std/[sysrand, strutils]
 import stew/byteutils
@@ -7,26 +7,34 @@ import ../noise/utils
 import ../noise/states
 
 proc main() =
-  # Simulate initiator
-  let initiatorHS = newHandshakeState(true, "NN")
+  echo "\n=== Noise KN Handshake Demo ==="
+  # Simulate initiator with static keypair
+  let initiatorKeypair = generateKeypair()
+  let initiatorHS = newHandshakeState(true, "KN", s = initiatorKeypair)
+  
+  # Simulate responder with initiator's static public key
+  let responderHS = newHandshakeState(false, "KN", rs = initiatorKeypair.`public`)
+  
+  # Initiator sends first message
   let (msg1, _, _) = initiatorHS.writeMessage(@[])
   echo "Initiator sent message 1: ", msg1.toHex.toLowerAscii
 
-  # Simulate responder
-  let responderHS = newHandshakeState(false, "NN")
+  # Responder processes first message
   let (payload1, _, _) = responderHS.readMessage(msg1)
   echo "Responder received payload 1: ", cast[string](payload1)
 
-  let helloResponder = strToBytes("Hello from responder!")
+  # Responder sends response with payload
+  let helloResponder = strToBytes("Hello from responder in KN!")
   let (msg2, sendCSResp, recvCSResp) = responderHS.writeMessage(helloResponder)
   echo "Responder sent message 2: ", msg2.toHex.toLowerAscii
 
-  # Initiator processes message 2
+  # Initiator processes response
   let (payload2, sendCSInit, recvCSInit) = initiatorHS.readMessage(msg2)
   echo "Initiator received payload 2: ", cast[string](payload2)
 
   # Post-handshake: Initiator sends encrypted message to responder
-  let message = strToBytes("Hello from initiator!")
+  echo "\n=== Post KN Handshake ==="
+  let message = strToBytes("Hello from initiator in KN!")
   let ciphertext = sendCSInit.encrypt(@[], message)
   echo "Initiator encrypted: ", ciphertext.toHex.toLowerAscii
 
@@ -35,7 +43,7 @@ proc main() =
   echo "Responder decrypted: ", cast[string](plaintext)
 
   # Post-handshake: Responder sends encrypted message to initiator
-  let message2 = strToBytes("Hi from responder!")
+  let message2 = strToBytes("Hi from responder in KN!")
   let ciphertext2 = sendCSResp.encrypt(@[], message2)
   echo "Responder encrypted: ", ciphertext2.toHex.toLowerAscii
 

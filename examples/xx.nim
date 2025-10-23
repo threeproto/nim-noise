@@ -5,8 +5,8 @@ import std/strutils
 
 import stew/byteutils
 
-import ../src/utils
-import ../src/states
+import ../noise/utils
+import ../noise/states
 
 proc main() =
   let pattern = "XX"

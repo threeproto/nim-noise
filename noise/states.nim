@@ -36,6 +36,10 @@ proc getPatternConfig(pattern: string): (seq[string], seq[string], seq[seq[strin
     (@[], @["s"], @[@["e", "es"], @["e", "ee"]])
   of "NX":
     (@[], @[], @[@["e"], @["e", "ee", "s", "es"]])
+  of "KN":
+    (@["s"], @[], @[@["e"], @["e", "ee", "se"]])
+  of "KX":
+    (@["s"], @[], @[@["e"], @["e", "ee", "se", "s", "es"]])
   of "XK":
     (@[], @["s"], @[@["e", "es"], @["e", "ee"], @["s", "se"]])
   of "XX":
