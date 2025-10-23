@@ -1,5 +1,7 @@
 # This file combines the definitions and procedures for CipherState, SymmetricState, and HandshakeState.
 
+import std/[strutils]
+
 import ./constants
 import ./types
 import ./utils
@@ -19,9 +21,27 @@ type
   HandshakeState* = ref object
     ss*: SymmetricState  # Symmetric state
     initiator*: bool  # Whether this is the initiator
+    s*: KeyPair  # Local static keypair
     e*: KeyPair  # Ephemeral keypair
+    rs*: array[DHLEN, byte]  # Remote static public key
     re*: array[DHLEN, byte]  # Remote ephemeral public key
     messagePatterns*: seq[seq[string]]  # Remaining message patterns
+
+# Get pattern configuration
+proc getPatternConfig(pattern: string): (seq[string], seq[string], seq[seq[string]]) =
+  case pattern.toUpperAscii
+  of "NN":
+    (@[], @[], @[@["e"], @["e", "ee"]])
+  of "NK":
+    (@[], @["s"], @[@["e", "es"], @["e", "ee"]])
+  of "NX":
+    (@[], @[], @[@["e"], @["e", "ee", "s", "es"]])
+  of "XK":
+    (@[], @["s"], @[@["e", "es"], @["e", "ee"], @["s", "se"]])
+  of "XX":
+    (@[], @[], @[@["e"], @["e", "ee", "s", "es"], @["s", "se"]])
+  else:
+    raise newException(ValueError, "Unsupported pattern: " & pattern)
 
 # CipherState handles symmetric encryption/decryption with nonce management.
 
@@ -79,9 +99,9 @@ proc initializeSymmetric*(ss: SymmetricState, protocolName: string) =
   ss.cs.initializeKey(zeros)
 
 # Create a new SymmetricState
-proc newSymmetricState*(): SymmetricState =
+proc newSymmetricState*(protocolName: string): SymmetricState =
   result = SymmetricState(cs: newCipherState())
-  result.initializeSymmetric(PROTOCOL_NAME)
+  result.initializeSymmetric(protocolName)
 
 # Mix key material into the chaining key and update cipher key
 proc mixKey*(ss: SymmetricState, inputKeyMaterial: openArray[byte]) =
@@ -125,13 +145,34 @@ proc split*(ss: SymmetricState): (CipherState, CipherState) =
 # HandshakeState manages the Noise NN handshake process.
 
 # Create a new HandshakeState
-proc newHandshakeState*(initiator: bool): HandshakeState =
+proc newHandshakeState*(
+  initiator: bool,
+  pattern: string,
+  s: KeyPair = KeyPair(),
+  rs: array[DHLEN, byte] = default(array[DHLEN, byte])
+): HandshakeState =
+  let protocolName = "Noise_" & pattern & "_25519_ChaChaPoly_SHA256"
+  let (preInit, preResp, messagePatterns) = getPatternConfig(pattern)
   result = HandshakeState(
-    ss: newSymmetricState(),
+    ss: newSymmetricState(protocolName),
     initiator: initiator,
-    messagePatterns: @[@["e"], @["e", "ee"]]
+    s: s,
+    rs: rs,
+    messagePatterns: messagePatterns
   )
   result.ss.mixHash(@[])
+
+  # Process pre-messages
+  if preInit.len > 0:
+    for token in preInit:
+      if token == "s":
+        let pub = if initiator: s.`public` else: rs
+        result.ss.mixHash(pub)
+  if preResp.len > 0:
+    for token in preResp:
+      if token == "s":
+        let pub = if initiator: rs else: s.`public`
+        result.ss.mixHash(pub)
 
 # Write a handshake message
 proc writeMessage*(hs: HandshakeState, payload: openArray[byte]): (seq[byte], CipherState, CipherState) =
@@ -145,11 +186,41 @@ proc writeMessage*(hs: HandshakeState, payload: openArray[byte]): (seq[byte], Ci
     case token
     of "e":
       hs.e = generateKeypair()
-      result[0].add(hs.e.`public`)
-      hs.ss.mixHash(hs.e.`public`)
+      let pk = hs.e.`public`
+      var temp: seq[byte]
+      if hs.ss.cs.hasKey():
+        var pkSeq = newSeq[byte](DHLEN)
+        copyMem(addr pkSeq[0], unsafeAddr pk[0], DHLEN)
+        temp = hs.ss.encryptAndHash(pkSeq)
+      else:
+        temp = newSeq[byte](DHLEN)
+        copyMem(addr temp[0], unsafeAddr pk[0], DHLEN)
+        hs.ss.mixHash(temp)
+      result[0].add(temp)
+    of "s":
+      let pk = hs.s.`public`
+      var temp: seq[byte]
+      if hs.ss.cs.hasKey():
+        var pkSeq = newSeq[byte](DHLEN)
+        copyMem(addr pkSeq[0], unsafeAddr pk[0], DHLEN)
+        temp = hs.ss.encryptAndHash(pkSeq)
+      else:
+        temp = newSeq[byte](DHLEN)
+        copyMem(addr temp[0], unsafeAddr pk[0], DHLEN)
+        hs.ss.mixHash(temp)
+      result[0].add(temp)
     of "ee":
-      let dhOut = dh(hs.e.private, hs.re)
-      hs.ss.mixKey(dhOut)
+      hs.ss.mixKey(dh(hs.e.private, hs.re))
+    of "es":
+      let priv = if hs.initiator: hs.e.private else: hs.s.private
+      let pub = if hs.initiator: hs.rs else: hs.re
+      hs.ss.mixKey(dh(priv, pub))
+    of "se":
+      let priv = if hs.initiator: hs.s.private else: hs.e.private
+      let pub = if hs.initiator: hs.re else: hs.rs
+      hs.ss.mixKey(dh(priv, pub))
+    of "ss":
+      hs.ss.mixKey(dh(hs.s.private, hs.rs))
     else:
       raise newException(ValueError, "unknown token: " & token)
 
@@ -173,15 +244,37 @@ proc readMessage*(hs: HandshakeState, message: openArray[byte]): (seq[byte], Cip
 
   for token in pattern:
     case token
-    of "e":
-      if pos + DHLEN > message.len:
+    of "e", "s":
+      let len = if hs.ss.cs.hasKey(): DHLEN + 16 else: DHLEN
+      if pos + len > message.len:
         raise newException(ValueError, "message too short")
-      copyMem(addr hs.re[0], unsafeAddr message[pos], DHLEN)
-      pos += DHLEN
-      hs.ss.mixHash(hs.re)
+      let temp = message[pos ..< pos + len]
+      pos += len
+      var pk: array[DHLEN, byte]
+      if hs.ss.cs.hasKey():
+        let decrypted = hs.ss.decryptAndHash(temp)
+        if decrypted.len != DHLEN:
+          raise newException(ValueError, "invalid decrypted key length")
+        copyMem(addr pk[0], unsafeAddr decrypted[0], DHLEN)
+      else:
+        copyMem(addr pk[0], unsafeAddr temp[0], DHLEN)
+        hs.ss.mixHash(temp)
+      if token == "e":
+        hs.re = pk
+      else:
+        hs.rs = pk
     of "ee":
-      let dhOut = dh(hs.e.private, hs.re)
-      hs.ss.mixKey(dhOut)
+      hs.ss.mixKey(dh(hs.e.private, hs.re))
+    of "es":
+      let priv = if hs.initiator: hs.e.private else: hs.s.private
+      let pub = if hs.initiator: hs.rs else: hs.re
+      hs.ss.mixKey(dh(priv, pub))
+    of "se":
+      let priv = if hs.initiator: hs.s.private else: hs.e.private
+      let pub = if hs.initiator: hs.re else: hs.rs
+      hs.ss.mixKey(dh(priv, pub))
+    of "ss":
+      hs.ss.mixKey(dh(hs.s.private, hs.rs))
     else:
       raise newException(ValueError, "unknown token: " & token)
 
