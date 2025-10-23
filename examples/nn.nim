@@ -3,17 +3,17 @@
 import std/[sysrand, strutils]
 import stew/byteutils
 
-import ./utils
-import ./states
+import ../src/utils
+import ../src/states
 
 proc main() =
   # Simulate initiator
-  let initiatorHS = newHandshakeState(true)
+  let initiatorHS = newHandshakeState(true, "NN")
   let (msg1, _, _) = initiatorHS.writeMessage(@[])
   echo "Initiator sent message 1: ", msg1.toHex.toLowerAscii
 
   # Simulate responder
-  let responderHS = newHandshakeState(false)
+  let responderHS = newHandshakeState(false, "NN")
   let (payload1, _, _) = responderHS.readMessage(msg1)
   echo "Responder received payload 1: ", cast[string](payload1)
 

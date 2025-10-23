@@ -12,5 +12,8 @@ srcDir        = "src"
 requires "nim >= 2.2.4",
     "bearssl >= 0.2.5", "nimcrypto", "monocypher", "stew"
 
-task noise, "Run Noise example":
-  exec "nim c -r src/main.nim"
+task nn, "Run Noise example":
+  exec "nim c -r examples/nn.nim"
+
+task xx, "Run Noise example":
+  exec "nim c -r examples/xx.nim"
